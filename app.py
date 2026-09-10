@@ -750,6 +750,222 @@ def complexity_for_code(code: str, language: str):
     }
 
 
+def _complexity_value_is_missing(value):
+    """Treat blank/placeholder complexity values as unavailable."""
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    return text in {
+        "", "n/a", "na", "unknown", "not available",
+        "none", "null", "-", "not determined"
+    }
+
+
+def normalize_complexity_result(result, code, language):
+    """Never let an online analyzer's N/A hide the deterministic local result."""
+    local = complexity_for_code(code, language)
+
+    tc = result.get("time_complexity")
+    if not isinstance(tc, dict):
+        tc = {}
+
+    sc = result.get("space_complexity")
+    if not isinstance(sc, dict):
+        sc = {}
+
+    time_keys = ("best_case", "average_case", "worst_case")
+    for key in time_keys:
+        if _complexity_value_is_missing(tc.get(key)):
+            tc[key] = local[key]
+
+    if _complexity_value_is_missing(tc.get("explanation")):
+        tc["explanation"] = local["explanation"]
+    if _complexity_value_is_missing(tc.get("details")):
+        tc["details"] = local["details"]
+
+    for key in ("complexity", "auxiliary_space", "input_space"):
+        if _complexity_value_is_missing(sc.get(key)):
+            sc[key] = local[key]
+
+    if _complexity_value_is_missing(sc.get("explanation")):
+        sc["explanation"] = local["space_explanation"]
+    if _complexity_value_is_missing(sc.get("details")):
+        sc["details"] = local["space_explanation"]
+
+    result["time_complexity"] = tc
+    result["space_complexity"] = sc
+    return result
+
+
+def _safe_java_output_value(expr, env):
+    """Evaluate the small set of Java expressions commonly used for teaching examples."""
+    expr = expr.strip()
+    if not expr:
+        return ""
+
+    # String literal.
+    if len(expr) >= 2 and expr[0] == '"' and expr[-1] == '"':
+        return bytes(expr[1:-1], "utf-8").decode("unicode_escape")
+
+    if expr in env:
+        return env[expr]
+
+    # Simple integer arithmetic using already-known integer variables.
+    if re.fullmatch(r"[0-9+\-*/% ()]+", expr) or re.fullmatch(r"[A-Za-z_]\w*(?:\s*[+\-*/%]\s*[A-Za-z_]\w*|\s*[+\-*/%]\s*\d+)+", expr):
+        try:
+            safe = re.sub(r"\b[A-Za-z_]\w*\b", lambda m: str(env.get(m.group(0), m.group(0))), expr)
+            if re.fullmatch(r"[0-9+\-*/% ().]+", safe):
+                return eval(safe, {"__builtins__": {}}, {})
+        except Exception:
+            pass
+
+    return expr
+
+
+def _render_java_print_expression(expr, env):
+    parts = re.split(r"\s*\+\s*", expr)
+    rendered = []
+    for part in parts:
+        part = part.strip()
+        value = _safe_java_output_value(part, env)
+        rendered.append(str(value))
+    return "".join(rendered)
+
+
+def local_java_console_output(code):
+    """Deterministically predict common Java console examples without executing source files."""
+    env = {}
+
+    # Basic integer declarations/assignments outside the loop.
+    for m in re.finditer(
+        r"\b(?:int|long|short|byte)\s+([A-Za-z_]\w*)\s*=\s*(-?\d+)\s*;",
+        code,
+    ):
+        env[m.group(1)] = int(m.group(2))
+
+    # Handle simple for-loops such as:
+    # for (int i = 1; i <= 3; i++) { sum += i; }
+    loop = re.search(
+        r"for\s*\(\s*(?:int|long|short|byte)\s+(\w+)\s*=\s*(-?\d+)\s*;\s*\1\s*(<=|<|>=|>)\s*(-?\d+)\s*;\s*\1\s*(\+\+|--|\+=\s*\d+|-=\s*\d+)\s*\)\s*\{([\s\S]*?)\}",
+        code,
+        flags=re.I,
+    )
+    if loop:
+        var, start, op, end, step, body = loop.groups()
+        i = int(start)
+        end = int(end)
+        guard = 0
+
+        def condition(v):
+            return {
+                "<": v < end,
+                "<=": v <= end,
+                ">": v > end,
+                ">=": v >= end,
+            }[op]
+
+        while condition(i) and guard < 10000:
+            guard += 1
+            env[var] = i
+
+            # Common accumulation/update statements.
+            for m in re.finditer(r"\b(\w+)\s*(\+=|-=|\*=|/=)\s*([^;]+)\s*;", body):
+                name, operator, rhs = m.groups()
+                rhs_value = _safe_java_output_value(rhs, env)
+                if isinstance(rhs_value, (int, float)):
+                    old = env.get(name, 0)
+                    if operator == "+=": env[name] = old + rhs_value
+                    elif operator == "-=": env[name] = old - rhs_value
+                    elif operator == "*=": env[name] = old * rhs_value
+                    elif operator == "/=": env[name] = old / rhs_value
+
+            # Also support direct assignments such as sum = sum + i.
+            for m in re.finditer(r"\b(?:int\s+)?(\w+)\s*=\s*([^;]+)\s*;", body):
+                name, rhs = m.groups()
+                value = _safe_java_output_value(rhs, env)
+                if isinstance(value, (int, float)):
+                    env[name] = value
+
+            if step == "++":
+                i += 1
+            elif step == "--":
+                i -= 1
+            elif "+=" in step:
+                i += int(re.search(r"\d+", step).group())
+            elif "-=" in step:
+                i -= int(re.search(r"\d+", step).group())
+
+    # System.out.println(...)
+    outputs = []
+    for m in re.finditer(r"System\.out\.println\s*\((.*?)\)\s*;", code, flags=re.S):
+        outputs.append(_render_java_print_expression(m.group(1), env))
+
+    for m in re.finditer(r"System\.out\.print\s*\((.*?)\)\s*;", code, flags=re.S):
+        outputs.append(_render_java_print_expression(m.group(1), env))
+
+    # Simple Java literal output even when no loop is present.
+    return "\n".join(x for x in outputs if x != "")
+
+
+def local_c_family_console_output(code):
+    """Small deterministic output fallback for common C/C++ teaching examples."""
+    env = {}
+    for m in re.finditer(r"\b(?:int|long|short)\s+(\w+)\s*=\s*(-?\d+)\s*;", code):
+        env[m.group(1)] = int(m.group(2))
+
+    # Accumulation inside a simple for loop.
+    loop = re.search(
+        r"for\s*\(\s*(?:int\s+)?(\w+)\s*=\s*(-?\d+)\s*;\s*\1\s*(<=|<|>=|>)\s*(-?\d+)\s*;\s*\1\s*(\+\+|--|\+=\s*\d+|-=\s*\d+)\s*\)\s*\{([\s\S]*?)\}",
+        code,
+        flags=re.I,
+    )
+    if loop:
+        var, start, op, end, step, body = loop.groups()
+        i, end = int(start), int(end)
+        guard = 0
+        while guard < 10000 and {"<": i < end, "<=": i <= end, ">": i > end, ">=": i >= end}[op]:
+            guard += 1
+            env[var] = i
+            for m in re.finditer(r"\b(\w+)\s*(\+=|-=)\s*([^;]+)\s*;", body):
+                name, operator, rhs = m.groups()
+                try:
+                    value = int(rhs.strip()) if rhs.strip().lstrip("-").isdigit() else env.get(rhs.strip(), 0)
+                    env[name] = env.get(name, 0) + value if operator == "+=" else env.get(name, 0) - value
+                except Exception:
+                    pass
+            if step == "++": i += 1
+            elif step == "--": i -= 1
+            elif "+=" in step: i += int(re.search(r"\d+", step).group())
+            elif "-=" in step: i -= int(re.search(r"\d+", step).group())
+
+    outputs = []
+    for m in re.finditer(r"printf\s*\(\s*\"([^\"]*)\"\s*(?:,\s*([^\)]*))?\)\s*;", code, flags=re.S):
+        fmt, args = m.groups()
+        if args:
+            vals = [env.get(a.strip(), a.strip()) for a in args.split(",")]
+            try:
+                outputs.append(fmt.replace("%d", "{}").format(*vals).replace("\\n", ""))
+            except Exception:
+                outputs.append(fmt.replace("%d", "{}") .format(*vals).replace("\\n", ""))
+        else:
+            outputs.append(fmt.replace("\\n", ""))
+
+    for m in re.finditer(r"cout\s*<<\s*(.*?);", code, flags=re.S):
+        expr = re.sub(r"\s*<<\s*endl\s*$", "", m.group(1).strip())
+        parts = re.split(r"\s*<<\s*", expr)
+        outputs.append("".join(str(_safe_java_output_value(x.strip(), env)) for x in parts))
+
+    return "\n".join(x for x in outputs if x != "")
+
+
+def local_console_output(code, language):
+    if language == "Java":
+        return local_java_console_output(code)
+    if language in {"C", "C++", "C#"}:
+        return local_c_family_console_output(code)
+    return ""
+
+
 # ============================================================
 # PYTHON VALUE FORMATTER
 # ============================================================
@@ -2221,6 +2437,17 @@ def run_analysis(
                 []
             )
 
+            # =================================================
+            # COMPLEXITY FIX:
+            # Online providers sometimes return N/A. Never let
+            # that placeholder hide the local deterministic result.
+            # =================================================
+            result = normalize_complexity_result(
+                result,
+                code,
+                language
+            )
+
             error_text = json.dumps(
                 result,
                 ensure_ascii=False
@@ -2287,6 +2514,20 @@ def run_analysis(
                     if outputs
                     else "No console output detected."
                 )
+            else:
+                # For Java/C/C++/C#, use a safe deterministic fallback
+                # when the online analyzer gives no usable output.
+                existing_output = result.get("predicted_output", "")
+                if _complexity_value_is_missing(existing_output) or str(existing_output).strip().lower() in {
+                    "no console output detected.",
+                    "no console output detected",
+                    "n/a",
+                    "none",
+                    "null",
+                }:
+                    local_output = local_console_output(code, language)
+                    if local_output:
+                        result["predicted_output"] = local_output
 
             return (
                 result,
@@ -3963,6 +4204,21 @@ if st.session_state.analysis:
                 "predicted_output",
                 ""
             )
+
+            if str(predicted).strip().lower() in {
+                "",
+                "n/a",
+                "none",
+                "null",
+                "no console output detected",
+                "no console output detected.",
+            }:
+                local_output = local_console_output(
+                    raw_code,
+                    selected_prog_lang
+                )
+                if local_output:
+                    predicted = local_output
 
         if not predicted:
 
