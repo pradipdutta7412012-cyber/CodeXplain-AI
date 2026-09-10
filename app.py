@@ -657,98 +657,84 @@ def count_constructs(code: str, language: str):
 # ============================================================
 
 def complexity_for_code(code: str, language: str):
+    """Deterministic complexity estimate used as a guaranteed fallback.
+    It handles common loop nesting, logarithmic loops, recursion and extra containers.
+    """
+    lines = [x for x in code.splitlines() if x.strip()]
+    low = code.lower()
+    loop_matches = list(re.finditer(r"\b(for|while)\b", low))
+    loops = len(loop_matches)
 
-    loops = len(
-        re.findall(
-            r"\b(for|while)\b",
-            code,
-            flags=re.I
-        )
-    )
+    # Count actual nesting by indentation for Python; for brace languages use the
+    # approximate source span between an outer and inner loop.
+    nested = False
+    if language == "Python":
+        stack = []
+        for raw in code.splitlines():
+            if not raw.strip():
+                continue
+            indent = len(raw) - len(raw.lstrip())
+            if re.match(r"^\s*(for|while)\b", raw):
+                while stack and indent <= stack[-1]:
+                    stack.pop()
+                if stack:
+                    nested = True
+                stack.append(indent)
+    else:
+        nested = bool(re.search(r"\b(for|while)\b[\s\S]{0,350}\b(for|while)\b", low))
 
-    nested = bool(
-        re.search(
-            r"\b(for|while)\b[\s\S]{0,600}\b(for|while)\b",
-            code,
-            flags=re.I
-        )
-    )
-
-    recursion = bool(
-        re.search(
-            r"\b(def|function|fn)\b",
-            code,
-            flags=re.I
-        )
-        and
-        re.search(
-            r"\b(return|recursive|recursion)\b",
-            code,
-            flags=re.I
-        )
-    )
-
-    array_growth = bool(
-        re.search(
-            r"\b(append|push|new\s+\w+\[|malloc|calloc|vector|list)\b",
-            code,
-            flags=re.I
-        )
-    )
+    logarithmic = bool(re.search(
+        r"(\bwhile\b[\s\S]{0,250}(?:/=|//=|>>=)|\bfor\b[^(\n]*=[^;\n]*(?:/=|>>=))",
+        low,
+    ))
+    recursion = bool(re.search(r"\b(def|function|func|fn)\b[\s\S]{0,500}\b\1?\b", low)) and False
+    # Safer recursion test: a function name appears again in its own body.
+    if language == "Python":
+        try:
+            tree = ast.parse(code)
+            recursion = any(
+                isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and
+                any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == n.name
+                    for c in ast.walk(n))
+                for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
+        except Exception:
+            recursion = False
+    else:
+        recursion = bool(re.search(r"\b(recursion|recursive)\b", low))
 
     if nested:
-
         tc = "O(n²)"
-
-        reason = (
-            "একটি loop-এর ভিতরে আরেকটি loop থাকলে "
-            "সাধারণভাবে n × n কাজ হয়।"
-        )
-
+        reason = "একটি input-sized loop-এর ভিতরে আরেকটি loop আছে, তাই মোট কাজ সাধারণভাবে n × n = O(n²)।"
+    elif logarithmic:
+        tc = "O(log n)"
+        reason = "Loop-এর variable প্রতিবার গুণ/ভাগ বা bit-shift-এর মাধ্যমে দ্রুত ছোট হচ্ছে, তাই iteration সংখ্যা প্রায় log n।"
     elif loops:
-
         tc = "O(n)"
-
-        reason = (
-            "একটি সাধারণ loop সাধারণত n বার চলতে পারে "
-            "এবং প্রতি iteration-এ constant কাজ হয়।"
-        )
-
+        reason = "একটি সাধারণ input-sized loop আছে; প্রতি iteration-এ প্রায় constant কাজ হচ্ছে, তাই O(n)।"
+    elif recursion:
+        tc = "O(n)"
+        reason = "Recursion input-এর আকারের সাথে বাড়ছে; সাধারণ linear recursion হিসেবে O(n) ধরা হয়েছে।"
     else:
-
         tc = "O(1)"
+        reason = "Input size-এর সাথে বাড়ে এমন loop/recursion পাওয়া যায়নি; তাই সাধারণভাবে O(1)।"
 
-        reason = (
-            "কোনো input-sized loop বা recursive growth "
-            "দেখা যাচ্ছে না; কাজ সাধারণভাবে constant।"
-        )
-
-    if array_growth or recursion:
-        sc = "O(n)"
-    else:
-        sc = "O(1)"
-
+    array_growth = bool(re.search(
+        r"\b(append|extend|push|add|malloc|calloc|realloc|new\s+\w+\[|vector|list|dict|set)\b|\[\s*\]",
+        low,
+    ))
+    sc = "O(n)" if array_growth or recursion else "O(1)"
     sc_reason = (
-        "একটি input-sized data structure তৈরি বা বাড়ছে, "
-        "তাই extra space n-এর সাথে বাড়তে পারে।"
-        if array_growth
-        else
-        "শুধু কয়েকটি variable ব্যবহার হচ্ছে; "
-        "input-এর সাথে extra memory বাড়ছে না।"
+        "Input-এর সাথে বাড়তে পারে এমন array/list/map/set বা recursive call stack আছে, তাই extra space O(n)।"
+        if array_growth or recursion else
+        "শুধু constant সংখ্যক variable ব্যবহার হচ্ছে; input-এর সাথে extra memory বাড়ছে না, তাই O(1)।"
     )
-
     return {
-        "best_case": tc,
-        "average_case": tc,
-        "worst_case": tc,
-        "explanation": reason,
-        "details": reason,
-        "complexity": sc,
-        "auxiliary_space": sc,
-        "input_space": "O(1)",
+        "best_case": tc, "average_case": tc, "worst_case": tc,
+        "explanation": reason, "details": reason,
+        "complexity": sc, "auxiliary_space": sc, "input_space": "O(1)",
         "space_explanation": sc_reason,
     }
-
 
 def _complexity_value_is_missing(value):
     """Treat blank/placeholder complexity values as unavailable."""
@@ -833,79 +819,67 @@ def _render_java_print_expression(expr, env):
 
 
 def local_java_console_output(code):
-    """Deterministically predict common Java console examples without executing source files."""
+    """Safely predict common deterministic Java console programs, including loop output."""
     env = {}
+    outputs = []
 
-    # Basic integer declarations/assignments outside the loop.
-    for m in re.finditer(
-        r"\b(?:int|long|short|byte)\s+([A-Za-z_]\w*)\s*=\s*(-?\d+)\s*;",
-        code,
-    ):
+    for m in re.finditer(r"\b(?:int|long|short|byte)\s+([A-Za-z_]\w*)\s*=\s*(-?\d+)\s*;", code):
         env[m.group(1)] = int(m.group(2))
 
-    # Handle simple for-loops such as:
-    # for (int i = 1; i <= 3; i++) { sum += i; }
     loop = re.search(
         r"for\s*\(\s*(?:int|long|short|byte)\s+(\w+)\s*=\s*(-?\d+)\s*;\s*\1\s*(<=|<|>=|>)\s*(-?\d+)\s*;\s*\1\s*(\+\+|--|\+=\s*\d+|-=\s*\d+)\s*\)\s*\{([\s\S]*?)\}",
-        code,
-        flags=re.I,
+        code, flags=re.I,
     )
+
+    def condition(v, op, endv):
+        return {"<": v < endv, "<=": v <= endv, ">": v > endv, ">=": v >= endv}[op]
+
+    def process_body(body):
+        for m in re.finditer(r"System\.out\.println\s*\((.*?)\)\s*;", body, flags=re.S):
+            outputs.append(_render_java_print_expression(m.group(1), env))
+        for m in re.finditer(r"System\.out\.print\s*\((.*?)\)\s*;", body, flags=re.S):
+            outputs.append(_render_java_print_expression(m.group(1), env))
+        for m in re.finditer(r"\b(\w+)\s*(\+=|-=|\*=|/=)\s*([^;]+)\s*;", body):
+            name, op, rhs = m.groups()
+            value = _safe_java_output_value(rhs, env)
+            if isinstance(value, (int, float)):
+                old = env.get(name, 0)
+                if op == "+=": env[name] = old + value
+                elif op == "-=": env[name] = old - value
+                elif op == "*=": env[name] = old * value
+                elif op == "/=": env[name] = old / value
+        for m in re.finditer(r"\b(?:int\s+)?(\w+)\s*=\s*([^;]+)\s*;", body):
+            name, rhs = m.groups()
+            value = _safe_java_output_value(rhs, env)
+            if isinstance(value, (int, float)):
+                env[name] = value
+
     if loop:
-        var, start, op, end, step, body = loop.groups()
-        i = int(start)
-        end = int(end)
+        var, start, op, endv, step, body = loop.groups()
+        i, endv = int(start), int(endv)
         guard = 0
-
-        def condition(v):
-            return {
-                "<": v < end,
-                "<=": v <= end,
-                ">": v > end,
-                ">=": v >= end,
-            }[op]
-
-        while condition(i) and guard < 10000:
+        while condition(i, op, endv) and guard < 10000:
             guard += 1
             env[var] = i
+            process_body(body)
+            if step == "++": i += 1
+            elif step == "--": i -= 1
+            elif "+=" in step: i += int(re.search(r"\d+", step).group())
+            elif "-=" in step: i -= int(re.search(r"\d+", step).group())
 
-            # Common accumulation/update statements.
-            for m in re.finditer(r"\b(\w+)\s*(\+=|-=|\*=|/=)\s*([^;]+)\s*;", body):
-                name, operator, rhs = m.groups()
-                rhs_value = _safe_java_output_value(rhs, env)
-                if isinstance(rhs_value, (int, float)):
-                    old = env.get(name, 0)
-                    if operator == "+=": env[name] = old + rhs_value
-                    elif operator == "-=": env[name] = old - rhs_value
-                    elif operator == "*=": env[name] = old * rhs_value
-                    elif operator == "/=": env[name] = old / rhs_value
+        # Prints outside the loop.
+        outside = code[:loop.start()] + code[loop.end():]
+        for m in re.finditer(r"System\.out\.println\s*\((.*?)\)\s*;", outside, flags=re.S):
+            outputs.append(_render_java_print_expression(m.group(1), env))
+        for m in re.finditer(r"System\.out\.print\s*\((.*?)\)\s*;", outside, flags=re.S):
+            outputs.append(_render_java_print_expression(m.group(1), env))
+    else:
+        for m in re.finditer(r"System\.out\.println\s*\((.*?)\)\s*;", code, flags=re.S):
+            outputs.append(_render_java_print_expression(m.group(1), env))
+        for m in re.finditer(r"System\.out\.print\s*\((.*?)\)\s*;", code, flags=re.S):
+            outputs.append(_render_java_print_expression(m.group(1), env))
 
-            # Also support direct assignments such as sum = sum + i.
-            for m in re.finditer(r"\b(?:int\s+)?(\w+)\s*=\s*([^;]+)\s*;", body):
-                name, rhs = m.groups()
-                value = _safe_java_output_value(rhs, env)
-                if isinstance(value, (int, float)):
-                    env[name] = value
-
-            if step == "++":
-                i += 1
-            elif step == "--":
-                i -= 1
-            elif "+=" in step:
-                i += int(re.search(r"\d+", step).group())
-            elif "-=" in step:
-                i -= int(re.search(r"\d+", step).group())
-
-    # System.out.println(...)
-    outputs = []
-    for m in re.finditer(r"System\.out\.println\s*\((.*?)\)\s*;", code, flags=re.S):
-        outputs.append(_render_java_print_expression(m.group(1), env))
-
-    for m in re.finditer(r"System\.out\.print\s*\((.*?)\)\s*;", code, flags=re.S):
-        outputs.append(_render_java_print_expression(m.group(1), env))
-
-    # Simple Java literal output even when no loop is present.
     return "\n".join(x for x in outputs if x != "")
-
 
 def local_c_family_console_output(code):
     """Small deterministic output fallback for common C/C++ teaching examples."""
@@ -963,8 +937,6 @@ def local_console_output(code, language):
         return local_java_console_output(code)
     if language in {"C", "C++", "C#"}:
         return local_c_family_console_output(code)
-    if language == "Bash":
-        return local_bash_console_output(code)
     return ""
 
 
@@ -1950,73 +1922,6 @@ def safe_mermaid(
 
 
 # ============================================================
-# DETERMINISTIC LIGHTWEIGHT CHECKS FOR SHELL/BASH
-# ============================================================
-
-def bash_static_issues(code: str):
-    """Catch a few safe, obvious Bash teaching mistakes without executing code."""
-    errors = []
-    corrected = code
-    lines = code.splitlines()
-
-    for idx, line in enumerate(lines, 1):
-        # echo "...: variable" is almost always an accidental literal variable name
-        # when the same variable was assigned earlier in the script.
-        m = re.search(r'echo\s+(["\'])(.*?)\1', line)
-        if m:
-            text = m.group(2)
-            assigned = set(re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*', code))
-            for name in assigned:
-                if re.search(rf'\b{name}\b', text) and not re.search(rf'\$\{{?{re.escape(name)}\}}?' , text):
-                    fixed_line = line.replace(name, f'${name}', 1)
-                    # Do not report if the word is clearly part of a longer word.
-                    if fixed_line != line:
-                        errors.append({
-                            "error_type": "Logic Error",
-                            "line_number": idx,
-                            "problematic_code": line,
-                            "what_happened": f'`{name}` is printed as plain text instead of using the variable value.',
-                            "why_happened": f'Bash treats `"{name}"` as literal text; the variable must be expanded with `${name}`.',
-                            "how_to_fix": f'Use: {fixed_line.strip()}',
-                        })
-                        corrected_lines = corrected.splitlines()
-                        corrected_lines[idx - 1] = fixed_line
-                        corrected = "\n".join(corrected_lines)
-                        break
-
-    return errors, corrected
-
-
-def local_bash_console_output(code: str):
-    """Predict common Bash read/arithmetic/echo examples using safe text parsing."""
-    env = {}
-    # Use deterministic sample values for interactive `read` prompts.
-    read_vars = re.findall(r'\bread\s+(?:-[^\s]+\s+)*([A-Za-z_][A-Za-z0-9_]*)', code)
-    for i, name in enumerate(read_vars):
-        env[name] = 10 if i == 0 else 20 if i == 1 else i + 1
-
-    # Handle simple arithmetic assignments such as sum=$((num1 + num2)).
-    for m in re.finditer(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\$\(\((.*?)\)\)', code):
-        name, expr = m.groups()
-        safe_expr = expr
-        for var, value in env.items():
-            safe_expr = re.sub(rf'\b{re.escape(var)}\b', str(value), safe_expr)
-        if re.fullmatch(r'[0-9+\-*/% ()]+', safe_expr.strip()):
-            try:
-                env[name] = eval(safe_expr, {"__builtins__": {}}, {})
-            except Exception:
-                pass
-
-    outputs = []
-    for m in re.finditer(r'\becho\s+(?:-e\s+)?(["\'])(.*?)\1', code):
-        text = m.group(2)
-        text = re.sub(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?', lambda x: str(env.get(x.group(1), x.group(0))), text)
-        outputs.append(text.replace('\\n', '\n'))
-
-    return "\n".join(outputs)
-
-
-# ============================================================
 # FALLBACK ANALYSIS
 # ============================================================
 
@@ -2043,13 +1948,6 @@ def fallback_analysis(
     has_real_error = (
         syntax_error is not None
     )
-
-    bash_errors, bash_corrected = (
-        bash_static_issues(code)
-        if language == "Bash"
-        else ([], code)
-    )
-    has_real_error = has_real_error or bool(bash_errors)
 
     complexity = complexity_for_code(
         code,
@@ -2234,8 +2132,6 @@ def fallback_analysis(
                 "Check brackets, quotes, colons and indentation.",
         })
 
-    errors.extend(bash_errors)
-
     trace = (
         local_python_trace(
             code,
@@ -2271,9 +2167,6 @@ def fallback_analysis(
             ):
 
                 predicted = "Sum: 6"
-
-        elif language == "Bash":
-            predicted = local_bash_console_output(code)
 
     if not predicted:
 
@@ -2338,10 +2231,8 @@ def fallback_analysis(
 
         "has_errors": bool(errors),
 
-        "corrected_full_code": (
-            bash_corrected
-            if language == "Bash" and bash_errors
-            else _get_valid_corrected_code(code, code, language)
+        "corrected_full_code": _get_valid_corrected_code(
+            code, code, language
         ),
 
         "dry_run": {
@@ -2393,6 +2284,39 @@ def fallback_analysis(
 # ============================================================
 # ANALYSIS WRAPPER
 # ============================================================
+
+def _ai_analysis_fallback(code: str, language: str, explanation_lang: str):
+    """Ask the configured AI for a strict structured code review when the local/existing
+    analyzer does not identify a real bug or returns incomplete analysis."""
+    prompt = f"""Analyze the following {language} program for CodeXplain.
+Return ONLY one valid JSON object, no markdown and no extra text.
+The explanation language MUST be {explanation_lang}.
+First determine whether there is a REAL syntax, compile-time, or clear logical/runtime error.
+Do not invent an error. If there is an error, identify the exact line, explain why, and provide a genuinely corrected full program.
+Also provide a realistic expected console output for deterministic code, and time/space complexity.
+Schema:
+{{
+  "has_errors": true/false,
+  "errors": [{{"error_type":"...","line_number":1,"problematic_code":"...","what_happened":"...","why_happened":"...","how_to_fix":"..."}}],
+  "corrected_full_code":"...",
+  "predicted_output":"...",
+  "time_complexity": {{"best_case":"O(?)","average_case":"O(?)","worst_case":"O(?)","explanation":"...","details":"..."}},
+  "space_complexity": {{"complexity":"O(?)","auxiliary_space":"O(?)","input_space":"O(?)","explanation":"...","details":"..."}},
+  "summary": {{"language":"{language}","errors_count":0}},
+  "line_by_line": [],
+  "learning_tips": []
+}}
+
+CODE:
+{code}"""
+    try:
+        raw, err = ask_codexplain(prompt, language, explanation_lang, mode="analysis")
+        if not raw:
+            return None
+        return clean_json_response(raw)
+    except Exception:
+        return None
+
 
 def run_analysis(
     code: str,
@@ -2525,22 +2449,27 @@ def run_analysis(
             # Online providers sometimes return N/A. Never let
             # that placeholder hide the local deterministic result.
             # =================================================
+            # If the existing analyzer missed errors or returned an incomplete analysis,
+            # use the configured AI as a second opinion. Local deterministic fallbacks still
+            # guarantee complexity/output when no provider is available.
+            needs_ai_review = (
+                (not result.get("errors") and not result.get("has_errors"))
+                or _complexity_value_is_missing(result.get("predicted_output"))
+                or (result.get("has_errors") and _complexity_value_is_missing(result.get("corrected_full_code")))
+            )
+            if needs_ai_review:
+                ai_review = _ai_analysis_fallback(code, language, explanation_lang)
+                if isinstance(ai_review, dict):
+                    for key in ("errors", "has_errors", "corrected_full_code", "predicted_output",
+                                "time_complexity", "space_complexity", "summary", "learning_tips"):
+                        if key in ai_review and ai_review[key] not in (None, "", []):
+                            result[key] = ai_review[key]
+
             result = normalize_complexity_result(
                 result,
                 code,
                 language
             )
-
-            # Deterministic Bash checks supplement the online analyzer so an obvious
-            # logic mistake is not hidden by an AI response saying "no errors".
-            if language == "Bash":
-                bash_errors, bash_corrected = bash_static_issues(code)
-                if bash_errors:
-                    existing_errors = result.get("errors") or []
-                    result["errors"] = existing_errors + bash_errors
-                    result["has_errors"] = True
-                    result.setdefault("summary", {})["errors_count"] = len(result["errors"])
-                    result["corrected_full_code"] = bash_corrected
 
             error_text = json.dumps(
                 result,
