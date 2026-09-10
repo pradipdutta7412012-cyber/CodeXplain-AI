@@ -10,7 +10,7 @@ Interactive multilingual programming learning and analysis platform built with P
 - Voice input for rough coding instructions / problem statements
 - Broad programming-language selection with extensible examples
 - Separate programming language and explanation language
-- Bengali, English, Hindi, Spanish, French, German and other common human-language choices
+- Bengali, English, Hindi
 - Code explanation and line-by-line breakdown
 - Error detection with error line and fix suggestions
 - Dry run / step-by-step execution where reliable
