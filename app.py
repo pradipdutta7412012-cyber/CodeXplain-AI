@@ -963,6 +963,8 @@ def local_console_output(code, language):
         return local_java_console_output(code)
     if language in {"C", "C++", "C#"}:
         return local_c_family_console_output(code)
+    if language == "Bash":
+        return local_bash_console_output(code)
     return ""
 
 
@@ -1948,6 +1950,73 @@ def safe_mermaid(
 
 
 # ============================================================
+# DETERMINISTIC LIGHTWEIGHT CHECKS FOR SHELL/BASH
+# ============================================================
+
+def bash_static_issues(code: str):
+    """Catch a few safe, obvious Bash teaching mistakes without executing code."""
+    errors = []
+    corrected = code
+    lines = code.splitlines()
+
+    for idx, line in enumerate(lines, 1):
+        # echo "...: variable" is almost always an accidental literal variable name
+        # when the same variable was assigned earlier in the script.
+        m = re.search(r'echo\s+(["\'])(.*?)\1', line)
+        if m:
+            text = m.group(2)
+            assigned = set(re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*', code))
+            for name in assigned:
+                if re.search(rf'\b{name}\b', text) and not re.search(rf'\$\{{?{re.escape(name)}\}}?' , text):
+                    fixed_line = line.replace(name, f'${name}', 1)
+                    # Do not report if the word is clearly part of a longer word.
+                    if fixed_line != line:
+                        errors.append({
+                            "error_type": "Logic Error",
+                            "line_number": idx,
+                            "problematic_code": line,
+                            "what_happened": f'`{name}` is printed as plain text instead of using the variable value.',
+                            "why_happened": f'Bash treats `"{name}"` as literal text; the variable must be expanded with `${name}`.',
+                            "how_to_fix": f'Use: {fixed_line.strip()}',
+                        })
+                        corrected_lines = corrected.splitlines()
+                        corrected_lines[idx - 1] = fixed_line
+                        corrected = "\n".join(corrected_lines)
+                        break
+
+    return errors, corrected
+
+
+def local_bash_console_output(code: str):
+    """Predict common Bash read/arithmetic/echo examples using safe text parsing."""
+    env = {}
+    # Use deterministic sample values for interactive `read` prompts.
+    read_vars = re.findall(r'\bread\s+(?:-[^\s]+\s+)*([A-Za-z_][A-Za-z0-9_]*)', code)
+    for i, name in enumerate(read_vars):
+        env[name] = 10 if i == 0 else 20 if i == 1 else i + 1
+
+    # Handle simple arithmetic assignments such as sum=$((num1 + num2)).
+    for m in re.finditer(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\$\(\((.*?)\)\)', code):
+        name, expr = m.groups()
+        safe_expr = expr
+        for var, value in env.items():
+            safe_expr = re.sub(rf'\b{re.escape(var)}\b', str(value), safe_expr)
+        if re.fullmatch(r'[0-9+\-*/% ()]+', safe_expr.strip()):
+            try:
+                env[name] = eval(safe_expr, {"__builtins__": {}}, {})
+            except Exception:
+                pass
+
+    outputs = []
+    for m in re.finditer(r'\becho\s+(?:-e\s+)?(["\'])(.*?)\1', code):
+        text = m.group(2)
+        text = re.sub(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?', lambda x: str(env.get(x.group(1), x.group(0))), text)
+        outputs.append(text.replace('\\n', '\n'))
+
+    return "\n".join(outputs)
+
+
+# ============================================================
 # FALLBACK ANALYSIS
 # ============================================================
 
@@ -1974,6 +2043,13 @@ def fallback_analysis(
     has_real_error = (
         syntax_error is not None
     )
+
+    bash_errors, bash_corrected = (
+        bash_static_issues(code)
+        if language == "Bash"
+        else ([], code)
+    )
+    has_real_error = has_real_error or bool(bash_errors)
 
     complexity = complexity_for_code(
         code,
@@ -2158,6 +2234,8 @@ def fallback_analysis(
                 "Check brackets, quotes, colons and indentation.",
         })
 
+    errors.extend(bash_errors)
+
     trace = (
         local_python_trace(
             code,
@@ -2193,6 +2271,9 @@ def fallback_analysis(
             ):
 
                 predicted = "Sum: 6"
+
+        elif language == "Bash":
+            predicted = local_bash_console_output(code)
 
     if not predicted:
 
@@ -2257,8 +2338,10 @@ def fallback_analysis(
 
         "has_errors": bool(errors),
 
-        "corrected_full_code": _get_valid_corrected_code(
-            code, code, language
+        "corrected_full_code": (
+            bash_corrected
+            if language == "Bash" and bash_errors
+            else _get_valid_corrected_code(code, code, language)
         ),
 
         "dry_run": {
@@ -2447,6 +2530,17 @@ def run_analysis(
                 code,
                 language
             )
+
+            # Deterministic Bash checks supplement the online analyzer so an obvious
+            # logic mistake is not hidden by an AI response saying "no errors".
+            if language == "Bash":
+                bash_errors, bash_corrected = bash_static_issues(code)
+                if bash_errors:
+                    existing_errors = result.get("errors") or []
+                    result["errors"] = existing_errors + bash_errors
+                    result["has_errors"] = True
+                    result.setdefault("summary", {})["errors_count"] = len(result["errors"])
+                    result["corrected_full_code"] = bash_corrected
 
             error_text = json.dumps(
                 result,
